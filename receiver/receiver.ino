@@ -21,6 +21,8 @@ static constexpr uint8_t PROTOCOL_VERSION = 1;
 
 static constexpr uint8_t PACKET_HID_REPORT = 1;
 static constexpr uint8_t PACKET_SWITCH_RECEIVER = 2;
+static constexpr uint8_t PACKET_DIAGNOSTICS = 3;
+static constexpr uint32_t DIAGNOSTICS_INTERVAL_MS = 2000;
 
 static constexpr uint8_t REPORT_ID_KEYBOARD = 1;
 static constexpr uint8_t REPORT_ID_MOUSE = 2;
@@ -74,6 +76,12 @@ volatile uint32_t switchCount = 0;
 
 volatile bool clearKeyboardPending = false;
 
+uint8_t senderMac[6] = {};
+volatile bool senderMacKnown = false;
+bool senderPeerAdded = false;
+uint32_t lastDiagnosticsSent = 0;
+uint32_t diagnosticsSendFailures = 0;
+
 // ============================================================
 // Debug
 // ============================================================
@@ -103,7 +111,10 @@ void onDataReceived(
   const uint8_t *data,
   int len) {
 
-  (void)info;
+  if (info != nullptr && !senderMacKnown) {
+    memcpy(senderMac, info->src_addr, sizeof(senderMac));
+    senderMacKnown = true;
+  }
 
   receivedCount++;
 
@@ -502,6 +513,61 @@ void processPacket(
 }
 
 // ============================================================
+// Reverse diagnostics link (receiver -> sender)
+// ============================================================
+
+void ensureSenderPeer() {
+  if (!senderMacKnown || senderPeerAdded) return;
+
+  if (esp_now_is_peer_exist(senderMac)) {
+    senderPeerAdded = true;
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, senderMac, sizeof(senderMac));
+  peerInfo.channel = WIFI_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+
+  esp_err_t err = esp_now_add_peer(&peerInfo);
+  if (err == ESP_OK) {
+    senderPeerAdded = true;
+    Serial.println("[DIAG] Sender peer registered");
+  } else {
+    Serial.printf("[DIAG] Adding sender peer failed: %d\\n", (int)err);
+  }
+}
+
+void sendDiagnostics() {
+  if (!senderMacKnown || !senderPeerAdded) return;
+
+  HidPacket packet = {};
+  packet.version = PROTOCOL_VERSION;
+  packet.type = PACKET_DIAGNOSTICS;
+  packet.reportLength = 24;
+
+  const uint32_t counters[6] = {
+    (uint32_t)receivedCount,
+    (uint32_t)keyboardCount,
+    (uint32_t)mouseCount,
+    (uint32_t)badPacketCount,
+    (uint32_t)queueDropCount,
+    (uint32_t)switchCount
+  };
+  memcpy(packet.data, counters, sizeof(counters));
+
+  esp_err_t err = esp_now_send(
+    senderMac,
+    reinterpret_cast<const uint8_t*>(&packet),
+    sizeof(packet)
+  );
+  if (err != ESP_OK) {
+    diagnosticsSendFailures++;
+  }
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
@@ -722,6 +788,13 @@ void loop() {
       (unsigned long)badPacketCount,
       (unsigned long)queueDropCount
     );
+  }
+
+  ensureSenderPeer();
+
+  if (now - lastDiagnosticsSent >= DIAGNOSTICS_INTERVAL_MS) {
+    lastDiagnosticsSent = now;
+    sendDiagnostics();
   }
 
   delay(1);

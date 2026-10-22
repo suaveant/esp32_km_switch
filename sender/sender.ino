@@ -17,6 +17,7 @@ static constexpr uint8_t PROTOCOL_VERSION = 1;
 static constexpr uint8_t RECEIVER_COUNT = 2;
 static constexpr uint8_t PACKET_HID_REPORT = 1;
 static constexpr uint8_t PACKET_SWITCH_RECEIVER = 2;
+static constexpr uint8_t PACKET_DIAGNOSTICS = 3;
 static constexpr uint8_t KEY_SWITCH_RECEIVER_1 = 0x6B; // F16
 static constexpr uint8_t KEY_SWITCH_RECEIVER_2 = 0x6A; // F15
 
@@ -67,6 +68,18 @@ volatile uint32_t sendFailures = 0, sendRetries = 0;
 bool wasReceiver1KeyDown = false, wasReceiver2KeyDown = false;
 volatile bool sendCallbackSuccess = false;
 
+struct ReceiverDiagnostics {
+  uint32_t received = 0;
+  uint32_t keyboard = 0;
+  uint32_t mouse = 0;
+  uint32_t bad = 0;
+  uint32_t queueDrops = 0;
+  uint32_t switches = 0;
+  uint32_t lastUpdateMs = 0;
+};
+ReceiverDiagnostics receiverDiag[RECEIVER_COUNT];
+portMUX_TYPE diagnosticsMux = portMUX_INITIALIZER_UNLOCKED;
+
 DeviceSlot* slotForRole(DeviceRole role) {
   return role == ROLE_KEYBOARD ? &keyboardSlot : &mouseSlot;
 }
@@ -97,6 +110,39 @@ void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
 }
 #endif
 
+void onEspNowReceived(
+  const esp_now_recv_info_t* info,
+  const uint8_t* data,
+  int len
+) {
+  if (!info || !data || len != (int)sizeof(HidPacket)) return;
+  if (data[0] != PROTOCOL_VERSION ||
+      data[1] != PACKET_DIAGNOSTICS ||
+      data[3] != 24) return;
+
+  int receiverIndex = -1;
+  for (uint8_t i = 0; i < RECEIVER_COUNT; ++i) {
+    if (memcmp(info->src_addr, receiverMacs[i], 6) == 0) {
+      receiverIndex = i;
+      break;
+    }
+  }
+  if (receiverIndex < 0) return;
+
+  uint32_t counters[6];
+  memcpy(counters, data + 4, sizeof(counters));
+
+  portENTER_CRITICAL(&diagnosticsMux);
+  receiverDiag[receiverIndex].received = counters[0];
+  receiverDiag[receiverIndex].keyboard = counters[1];
+  receiverDiag[receiverIndex].mouse = counters[2];
+  receiverDiag[receiverIndex].bad = counters[3];
+  receiverDiag[receiverIndex].queueDrops = counters[4];
+  receiverDiag[receiverIndex].switches = counters[5];
+  receiverDiag[receiverIndex].lastUpdateMs = millis();
+  portEXIT_CRITICAL(&diagnosticsMux);
+}
+
 bool initEspNow() {
   WiFi.mode(WIFI_STA);  // Required for ESP-NOW; no router connection is used.
   esp_err_t err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -109,6 +155,11 @@ bool initEspNow() {
     return false;
   }
   esp_now_register_send_cb(onEspNowSent);
+  err = esp_now_register_recv_cb(onEspNowReceived);
+  if (err != ESP_OK) {
+    Serial.printf("ESP-NOW receive callback registration failed: %d\\n", (int)err);
+    return false;
+  }
 
   for (uint8_t i = 0; i < RECEIVER_COUNT; i++) {
     esp_now_peer_info_t peerInfo = {};
@@ -482,6 +533,35 @@ void startScan() {
   scan->start(0, false);
 }
 
+void printReceiverDiagnostics() {
+  ReceiverDiagnostics snapshot[RECEIVER_COUNT];
+
+  portENTER_CRITICAL(&diagnosticsMux);
+  memcpy(snapshot, receiverDiag, sizeof(snapshot));
+  portEXIT_CRITICAL(&diagnosticsMux);
+
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < RECEIVER_COUNT; ++i) {
+    const ReceiverDiagnostics& d = snapshot[i];
+    if (d.lastUpdateMs == 0) {
+      Serial.printf("[RX%u DIAG] waiting for first report\\n", i + 1);
+      continue;
+    }
+
+    Serial.printf(
+      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu\\n",
+      i + 1,
+      (unsigned long)(now - d.lastUpdateMs),
+      (unsigned long)d.received,
+      (unsigned long)d.keyboard,
+      (unsigned long)d.mouse,
+      (unsigned long)d.bad,
+      (unsigned long)d.queueDrops,
+      (unsigned long)d.switches
+    );
+  }
+}
+
 // ---------------- Setup / loop ----------------
 void setup() {
   Serial.begin(115200);
@@ -530,6 +610,7 @@ void loop() {
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
       (unsigned long)reportsDropped, (unsigned long)sendFailures,
       (unsigned long)sendRetries, activeReceiver);
+    printReceiverDiagnostics();
   }
 
   static uint32_t lastScanCheck = 0;
