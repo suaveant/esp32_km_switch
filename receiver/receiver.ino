@@ -13,10 +13,12 @@
 Adafruit_NeoPixel pixel(1, 48, NEO_GRB + NEO_KHZ800);
 
 // ============================================================
-// ESP-NOW protocol shared with the sender
+// ESP-NOW protocol
+// MUST match sender/sender.ino
 // ============================================================
 
 static constexpr uint8_t PROTOCOL_VERSION = 1;
+
 static constexpr uint8_t PACKET_HID_REPORT = 1;
 static constexpr uint8_t PACKET_SWITCH_RECEIVER = 2;
 
@@ -39,8 +41,10 @@ struct __attribute__((packed)) HidPacket {
   uint8_t data[MAX_REPORT_SIZE];
 };
 
-static_assert(sizeof(HidPacket) == PACKET_SIZE,
-              "Unexpected HidPacket size");
+static_assert(
+  sizeof(HidPacket) == PACKET_SIZE,
+  "Unexpected HidPacket size"
+);
 
 struct RxItem {
   uint8_t length;
@@ -71,6 +75,12 @@ volatile uint32_t switchCount = 0;
 volatile bool clearKeyboardPending = false;
 
 // ============================================================
+// Debug
+// ============================================================
+
+bool printedBadPacket = false;
+
+// ============================================================
 // Active receiver LED
 // ============================================================
 
@@ -99,6 +109,16 @@ void onDataReceived(
 
   if (len != PACKET_SIZE) {
     badPacketCount++;
+
+    if (!printedBadPacket) {
+      printedBadPacket = true;
+
+      Serial.printf(
+        "[BAD RX] Unexpected packet length: %d\n",
+        len
+      );
+    }
+
     return;
   }
 
@@ -106,14 +126,17 @@ void onDataReceived(
 
   item.length = (uint8_t)len;
 
-  memcpy(item.data, data, PACKET_SIZE);
+  memcpy(
+    item.data,
+    data,
+    PACKET_SIZE
+  );
 
-  // Never wait for the queue inside the Wi-Fi callback.
+  // Never block inside the ESP-NOW callback.
   if (xQueueSend(rxQueue, &item, 0) != pdTRUE) {
+
     queueDropCount++;
 
-    // Make sure any held keyboard keys are released if
-    // the queue overflows.
     clearKeyboardPending = true;
   }
 }
@@ -123,16 +146,18 @@ void onDataReceived(
 // ============================================================
 
 void sendNeutralKeyboardReport() {
+
   KeyReport report = {};
 
   keyboard.sendReport(&report);
 }
 
 // ============================================================
-// Sign-extend a 12-bit signed HID value
+// Decode signed 12-bit HID value
 // ============================================================
 
 int16_t signExtend12(uint16_t value) {
+
   value &= 0x0FFF;
 
   if (value & 0x0800) {
@@ -143,54 +168,41 @@ int16_t signExtend12(uint16_t value) {
 }
 
 // ============================================================
-// Decode Logitech M720 7-byte mouse report
+// Process M720 mouse report
 //
-// Byte 0:
-//   Button bits 0-7
+// M720 report ID 2:
 //
-// Byte 1:
-//   Button bits 8-15
-//
-// Bytes 2-4:
-//   X and Y are signed 12-bit values
-//
-// Byte 5:
-//   Vertical wheel
-//
-// Byte 6:
-//   Horizontal wheel / pan
-//
-// Layout:
-//
-//   byte 2       = X bits 0-7
-//   byte 3 low   = X bits 8-11
-//   byte 3 high  = Y bits 0-3
-//   byte 4       = Y bits 4-11
+// Byte 0 = button bits 0-7
+// Byte 1 = button bits 8-15
+// Byte 2 = X bits 0-7
+// Byte 3 = X bits 8-11 + Y bits 0-3
+// Byte 4 = Y bits 4-11
+// Byte 5 = vertical wheel
+// Byte 6 = horizontal wheel
 // ============================================================
 
-void processMouseReport(const uint8_t *payload, uint8_t reportLength) {
+void processMouseReport(
+  const uint8_t *payload,
+  uint8_t reportLength) {
 
   if (reportLength != 7) {
+
     badPacketCount++;
+
+    Serial.printf(
+      "[BAD MOUSE] Expected length 7, got %u\n",
+      reportLength
+    );
+
     return;
   }
 
   // ----------------------------------------------------------
   // Buttons
-  //
-  // USBHIDMouse supports the standard five mouse buttons:
-  //
-  // bit 0 = left
-  // bit 1 = right
-  // bit 2 = middle
-  // bit 3 = back
-  // bit 4 = forward
-  //
-  // The M720 exposes more button bits in its report, but the
-  // standard Arduino USB mouse descriptor has five buttons.
   // ----------------------------------------------------------
 
-  uint8_t buttons = payload[0] & 0x1F;
+  uint8_t buttons =
+    payload[0] & MOUSE_ALL;
 
   // ----------------------------------------------------------
   // X
@@ -200,6 +212,8 @@ void processMouseReport(const uint8_t *payload, uint8_t reportLength) {
     ((uint16_t)payload[2]) |
     (((uint16_t)payload[3] & 0x0F) << 8);
 
+  int16_t x = signExtend12(rawX);
+
   // ----------------------------------------------------------
   // Y
   // ----------------------------------------------------------
@@ -208,118 +222,159 @@ void processMouseReport(const uint8_t *payload, uint8_t reportLength) {
     (((uint16_t)payload[3] >> 4) & 0x0F) |
     ((uint16_t)payload[4] << 4);
 
-  int16_t x = signExtend12(rawX);
   int16_t y = signExtend12(rawY);
 
-  // The Arduino relative mouse API uses int8_t movement.
-  //
-  // Normal M720 reports fit easily in this range. If Logitech
-  // ever produces a larger value, clamp it rather than
-  // allowing an integer wrap.
-  int8_t mouseX;
+  // ----------------------------------------------------------
+  // Wheel
+  // ----------------------------------------------------------
 
-  int8_t mouseY;
+  int8_t wheel =
+    (int8_t)payload[5];
+
+  // ----------------------------------------------------------
+  // Horizontal wheel
+  // ----------------------------------------------------------
+
+  int8_t pan =
+    (int8_t)payload[6];
+
+  // ----------------------------------------------------------
+  // USB HID mouse uses int8_t relative movement.
+  //
+  // Clamp the M720's 12-bit movement values to the USB
+  // mouse report range.
+  // ----------------------------------------------------------
+
+  int8_t dx;
+
+  int8_t dy;
 
   if (x > 127) {
-    mouseX = 127;
+    dx = 127;
   } else if (x < -127) {
-    mouseX = -127;
+    dx = -127;
   } else {
-    mouseX = (int8_t)x;
+    dx = (int8_t)x;
   }
 
   if (y > 127) {
-    mouseY = 127;
+    dy = 127;
   } else if (y < -127) {
-    mouseY = -127;
+    dy = -127;
   } else {
-    mouseY = (int8_t)y;
+    dy = (int8_t)y;
   }
 
   // ----------------------------------------------------------
-  // Wheels
-  // ----------------------------------------------------------
-
-  int8_t wheel = (int8_t)payload[5];
-  int8_t pan = (int8_t)payload[6];
-
-  // ----------------------------------------------------------
-  // Update the USB mouse state.
+  // Keep USB button state synchronized with the M720.
   //
-  // buttons() generates a button report if the button state
-  // changed. We then send movement/wheel in the same report.
-  // To avoid sending a duplicate button-only report followed
-  // immediately by movement, directly maintain the internal
-  // state through the public API and send movement.
+  // USBHIDMouse maintains the button state internally.
+  // buttons() sends a report when the state changes.
   // ----------------------------------------------------------
 
-  // USBHIDMouse::buttons() is public, but calling it can emit
-  // its own report. We need reliable button state even when
-  // there is no movement, so use the standard API here.
-  //
-  // For movement reports, press/release state is maintained
-  // internally by the mouse object.
   static uint8_t previousButtons = 0;
 
   if (buttons != previousButtons) {
 
-    // Release buttons that are no longer pressed.
-    uint8_t released = previousButtons & ~buttons;
-
-    if (released) {
-      mouse.release(released);
-    }
-
-    // Press newly pressed buttons.
-    uint8_t pressed = buttons & ~previousButtons;
-
-    if (pressed) {
-      mouse.press(pressed);
-    }
+    mouse.buttons(buttons);
 
     previousButtons = buttons;
   }
 
   // ----------------------------------------------------------
-  // Send movement / wheel / pan.
+  // Send movement/wheel/pan.
   //
-  // This also carries the current button state.
+  // This report includes the current button state.
   // ----------------------------------------------------------
 
-  mouse.move(mouseX, mouseY, wheel, pan);
+  mouse.move(
+    dx,
+    dy,
+    wheel,
+    pan
+  );
 
   mouseCount++;
 }
 
 // ============================================================
-// Process one ESP-NOW packet
+// Process one packet
 // ============================================================
 
-void processPacket(const RxItem &item) {
+void processPacket(
+  const RxItem &item) {
 
   if (item.length != PACKET_SIZE) {
+
     badPacketCount++;
+
     return;
   }
 
-  const uint8_t *p = item.data;
+  const uint8_t *p =
+    item.data;
 
-  uint8_t version = p[0];
-  uint8_t type = p[1];
-  uint8_t reportId = p[2];
-  uint8_t reportLength = p[3];
+  uint8_t version =
+    p[0];
 
-  if (version != PROTOCOL_VERSION ||
-      reportLength > MAX_REPORT_SIZE) {
+  uint8_t type =
+    p[1];
+
+  uint8_t reportId =
+    p[2];
+
+  uint8_t reportLength =
+    p[3];
+
+  // ----------------------------------------------------------
+  // Validate common packet header
+  // ----------------------------------------------------------
+
+  if (version != PROTOCOL_VERSION) {
 
     badPacketCount++;
+
+    if (!printedBadPacket) {
+
+      printedBadPacket = true;
+
+      Serial.printf(
+        "[BAD RX] version=%u type=%u id=%u length=%u\n",
+        version,
+        type,
+        reportId,
+        reportLength
+      );
+    }
+
     return;
   }
 
-  const uint8_t *payload = p + HEADER_SIZE;
+  if (reportLength > MAX_REPORT_SIZE) {
+
+    badPacketCount++;
+
+    if (!printedBadPacket) {
+
+      printedBadPacket = true;
+
+      Serial.printf(
+        "[BAD RX] version=%u type=%u id=%u length=%u\n",
+        version,
+        type,
+        reportId,
+        reportLength
+      );
+    }
+
+    return;
+  }
+
+  const uint8_t *payload =
+    p + HEADER_SIZE;
 
   // ==========================================================
-  // HID report
+  // HID REPORT
   // ==========================================================
 
   if (type == PACKET_HID_REPORT) {
@@ -328,27 +383,28 @@ void processPacket(const RxItem &item) {
     // Keyboard
     // --------------------------------------------------------
 
-    if (reportId == REPORT_ID_KEYBOARD) {
-
-      if (reportLength != 8) {
-        badPacketCount++;
-        return;
-      }
-
-      // Incoming boot keyboard payload:
-      //
-      // byte 0 = modifier bits
-      // byte 1 = reserved
-      // bytes 2-7 = six HID key usages
+    if (
+      reportId == REPORT_ID_KEYBOARD &&
+      reportLength == 8
+    ) {
 
       KeyReport report = {};
 
-      report.modifiers = payload[0];
-      report.reserved = payload[1];
+      report.modifiers =
+        payload[0];
 
-      memcpy(report.keys, payload + 2, 6);
+      report.reserved =
+        payload[1];
 
-      keyboard.sendReport(&report);
+      memcpy(
+        report.keys,
+        payload + 2,
+        6
+      );
+
+      keyboard.sendReport(
+        &report
+      );
 
       keyboardCount++;
 
@@ -359,32 +415,65 @@ void processPacket(const RxItem &item) {
     // Mouse
     // --------------------------------------------------------
 
-    if (reportId == REPORT_ID_MOUSE) {
+    if (
+      reportId == REPORT_ID_MOUSE &&
+      reportLength == 7
+    ) {
 
-      if (reportLength != 7) {
-        badPacketCount++;
-        return;
-      }
-
-      processMouseReport(payload, reportLength);
+      processMouseReport(
+        payload,
+        reportLength
+      );
 
       return;
     }
 
-    // Unknown HID report ID.
+    // --------------------------------------------------------
+    // Unknown HID report
+    // --------------------------------------------------------
+
     badPacketCount++;
+
+    if (!printedBadPacket) {
+
+      printedBadPacket = true;
+
+      Serial.printf(
+        "[BAD HID] type=%u id=%u length=%u\n",
+        type,
+        reportId,
+        reportLength
+      );
+
+      Serial.print("[BAD HID] data:");
+
+      for (uint8_t i = 0; i < reportLength; i++) {
+        Serial.printf(
+          " %02X",
+          payload[i]
+        );
+      }
+
+      Serial.println();
+    }
 
     return;
   }
 
   // ==========================================================
-  // Receiver switch packet
+  // RECEIVER SWITCH
   // ==========================================================
 
   if (type == PACKET_SWITCH_RECEIVER) {
 
     if (reportLength >= 1) {
-      setActiveLed(payload[0] == RECEIVER_ID);
+
+      uint8_t receiverId =
+        payload[0];
+
+      setActiveLed(
+        receiverId == RECEIVER_ID
+      );
     }
 
     switchCount++;
@@ -392,12 +481,28 @@ void processPacket(const RxItem &item) {
     return;
   }
 
-  // Unknown packet type.
+  // ==========================================================
+  // UNKNOWN PACKET TYPE
+  // ==========================================================
+
   badPacketCount++;
+
+  if (!printedBadPacket) {
+
+    printedBadPacket = true;
+
+    Serial.printf(
+      "[BAD TYPE] version=%u type=%u id=%u length=%u\n",
+      version,
+      type,
+      reportId,
+      reportLength
+    );
+  }
 }
 
 // ============================================================
-// Setup
+// SETUP
 // ============================================================
 
 void setup() {
@@ -412,9 +517,7 @@ void setup() {
   Serial.println("==============================");
 
   // ==========================================================
-  // USB device name
-  //
-  // Must be set BEFORE USB.begin().
+  // USB product name
   // ==========================================================
 
 #if RECEIVER_ID == 1
@@ -428,10 +531,7 @@ void setup() {
   // ==========================================================
   // IMPORTANT:
   //
-  // Keep the existing initialization order.
-  //
-  // This was deliberately NOT changed from the working
-  // receiver firmware.
+  // Preserve the working initialization order.
   // ==========================================================
 
   keyboard.begin();
@@ -439,10 +539,11 @@ void setup() {
   USB.begin();
 
   // ==========================================================
-  // Status LED
+  // LED
   // ==========================================================
 
   pixel.begin();
+
   pixel.setBrightness(20);
 
   setActiveLed(false);
@@ -451,14 +552,17 @@ void setup() {
   // RX queue
   // ==========================================================
 
-  rxQueue = xQueueCreate(
-    RX_QUEUE_DEPTH,
-    sizeof(RxItem)
-  );
+  rxQueue =
+    xQueueCreate(
+      RX_QUEUE_DEPTH,
+      sizeof(RxItem)
+    );
 
   if (rxQueue == nullptr) {
 
-    Serial.println("ERROR: Could not create RX queue");
+    Serial.println(
+      "ERROR: Could not create RX queue"
+    );
 
     while (true) {
       delay(1000);
@@ -466,14 +570,12 @@ void setup() {
   }
 
   // ==========================================================
-  // ESP-NOW / Wi-Fi
+  // Wi-Fi
   // ==========================================================
 
   WiFi.mode(WIFI_STA);
 
   WiFi.disconnect();
-
-  // ESP-NOW operates on the same channel as the sender.
 
   esp_err_t err =
     esp_wifi_set_channel(
@@ -490,7 +592,9 @@ void setup() {
   }
 
   Serial.print("Wi-Fi MAC: ");
-  Serial.println(WiFi.macAddress());
+  Serial.println(
+    WiFi.macAddress()
+  );
 
   Serial.printf(
     "Wi-Fi channel: %u\n",
@@ -515,9 +619,10 @@ void setup() {
     }
   }
 
-  err = esp_now_register_recv_cb(
-    onDataReceived
-  );
+  err =
+    esp_now_register_recv_cb(
+      onDataReceived
+    );
 
   if (err != ESP_OK) {
 
@@ -531,9 +636,18 @@ void setup() {
     }
   }
 
-  Serial.println("USB HID keyboard initialized");
-  Serial.println("USB HID mouse initialized");
-  Serial.println("ESP-NOW initialized");
+  Serial.println(
+    "USB HID keyboard initialized"
+  );
+
+  Serial.println(
+    "USB HID mouse initialized"
+  );
+
+  Serial.println(
+    "ESP-NOW initialized"
+  );
+
   Serial.printf(
     "Receiver ID: %d\n",
     RECEIVER_ID
@@ -545,13 +659,13 @@ void setup() {
 }
 
 // ============================================================
-// Main loop
+// LOOP
 // ============================================================
 
 void loop() {
 
   // ==========================================================
-  // If the queue overflowed, clear any potentially stuck keys.
+  // Clear keyboard if queue overflow occurred
   // ==========================================================
 
   if (clearKeyboardPending) {
@@ -562,7 +676,7 @@ void loop() {
   }
 
   // ==========================================================
-  // Drain queued reports as quickly as possible.
+  // Drain RX queue
   // ==========================================================
 
   RxItem item;
@@ -579,14 +693,17 @@ void loop() {
   }
 
   // ==========================================================
-  // Status output
+  // Status
   // ==========================================================
 
   static uint32_t lastStatus = 0;
 
-  uint32_t now = millis();
+  uint32_t now =
+    millis();
 
-  if (now - lastStatus >= 5000) {
+  if (
+    now - lastStatus >= 5000
+  ) {
 
     lastStatus = now;
 

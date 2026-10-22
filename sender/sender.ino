@@ -3,16 +3,15 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_idf_version.h>
 #include <cstring>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-
-// Dual BLE keyboard + mouse sender. ESP-NOW packet format remains 36 bytes.
-// BLE advertised names must contain "Keychron" (keyboard) and "M720" (mouse).
-// M720 standard mouse report ID 2 is 7 bytes. Receiver must support report ID 2.
+#include "freertos/semphr.h"
 
 #define HID_SERVICE_UUID 0x1812
 #define HID_REPORT_UUID  0x2A4D
+
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
 static constexpr uint8_t PROTOCOL_VERSION = 1;
 static constexpr uint8_t RECEIVER_COUNT = 2;
@@ -22,8 +21,8 @@ static constexpr uint8_t KEY_SWITCH_RECEIVER_1 = 0x6B; // F16
 static constexpr uint8_t KEY_SWITCH_RECEIVER_2 = 0x6A; // F15
 
 uint8_t receiverMacs[RECEIVER_COUNT][6] = {
-  { 0x90, 0xDA, 0x72, 0x73, 0x4C, 0x18 },
-  { 0xD4, 0x05, 0x92, 0x49, 0x9C, 0x40 }
+  {0x90, 0xDA, 0x72, 0x73, 0x4C, 0x18},
+  {0xD4, 0x05, 0x92, 0x49, 0x9C, 0x40}
 };
 
 struct __attribute__((packed)) HidPacket {
@@ -57,19 +56,22 @@ struct ReportMapEntry {
   DeviceRole role;
 };
 ReportMapEntry reportMap[16];
-uint8_t reportMapCount = 0;
+volatile uint8_t reportMapCount = 0;
 
 QueueHandle_t hidPacketQueue = nullptr;
-uint8_t activeReceiver = 1;
+SemaphoreHandle_t sendDoneSemaphore = nullptr;
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t activeReceiver = 1;
 volatile uint32_t reportsQueued = 0, reportsDropped = 0, reportsSent = 0;
+volatile uint32_t sendFailures = 0, sendRetries = 0;
 bool wasReceiver1KeyDown = false, wasReceiver2KeyDown = false;
+volatile bool sendCallbackSuccess = false;
 
 DeviceSlot* slotForRole(DeviceRole role) {
   return role == ROLE_KEYBOARD ? &keyboardSlot : &mouseSlot;
 }
+
 bool queueHidReport(uint8_t reportId, const uint8_t* data, size_t length);
-void processEspNowQueue();
-void broadcastReceiverState();
 void discoverHID(DeviceSlot& slot, DeviceRole role);
 void startScan();
 
@@ -80,18 +82,34 @@ bool containsIgnoreCase(const std::string& value, const char* needle) {
   return a.indexOf(b) >= 0;
 }
 
-// ---------------- ESP-NOW ----------------
+// ESP-NOW callback signature changed with ESP-IDF 5.5.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
+  (void)txInfo;
+  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
+}
+#else
+void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
+  (void)mac;
+  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
+}
+#endif
+
 bool initEspNow() {
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_STA);  // Required for ESP-NOW; no router connection is used.
   esp_err_t err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (err != ESP_OK) {
-    Serial.printf("Wi-Fi channel setup failed: %d\n", err);
+    Serial.printf("Wi-Fi channel setup failed: %d\n", (int)err);
     return false;
   }
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW initialization failed");
     return false;
   }
+  esp_now_register_send_cb(onEspNowSent);
+
   for (uint8_t i = 0; i < RECEIVER_COUNT; i++) {
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, receiverMacs[i], 6);
@@ -101,23 +119,40 @@ bool initEspNow() {
     if (esp_now_is_peer_exist(receiverMacs[i])) esp_now_del_peer(receiverMacs[i]);
     err = esp_now_add_peer(&peerInfo);
     if (err != ESP_OK) {
-      Serial.printf("Adding receiver %u failed: %d\n", i + 1, err);
+      Serial.printf("Adding receiver %u failed: %d\n", i + 1, (int)err);
       return false;
     }
     Serial.printf("Added ESP-NOW receiver %u\n", i + 1);
   }
-  hidPacketQueue = xQueueCreate(32, sizeof(HidPacket));
-  if (!hidPacketQueue) {
-    Serial.println("Could not create HID packet queue");
+
+  hidPacketQueue = xQueueCreate(64, sizeof(HidPacket));
+  sendDoneSemaphore = xSemaphoreCreateBinary();
+  if (!hidPacketQueue || !sendDoneSemaphore) {
+    Serial.println("Could not create ESP-NOW queue/semaphore");
     return false;
   }
-  Serial.printf("ESP-NOW channel %u; packet size=%u\n",
+  Serial.printf("ESP-NOW channel %u; packet size=%u; queue depth=64\n",
                 ESPNOW_CHANNEL, (unsigned)sizeof(HidPacket));
   return true;
 }
 
+bool queuePacket(const HidPacket& packet) {
+  if (!hidPacketQueue) {
+    reportsDropped++;
+    return false;
+  }
+  if (xQueueSend(hidPacketQueue, &packet, 0) != pdTRUE) {
+    // Keep the input callback non-blocking. Queue depth is deliberately larger
+    // than before; overflow is counted so it is visible in serial diagnostics.
+    reportsDropped++;
+    return false;
+  }
+  reportsQueued++;
+  return true;
+}
+
 bool queueHidReport(uint8_t reportId, const uint8_t* data, size_t length) {
-  if (!hidPacketQueue || !data || !length || length > sizeof(HidPacket::data)) {
+  if (!data || !length || length > sizeof(HidPacket::data)) {
     reportsDropped++;
     return false;
   }
@@ -127,22 +162,64 @@ bool queueHidReport(uint8_t reportId, const uint8_t* data, size_t length) {
   packet.reportId = reportId;
   packet.reportLength = (uint8_t)length;
   memcpy(packet.data, data, length);
-  if (xQueueSend(hidPacketQueue, &packet, 0) != pdTRUE) {
-    reportsDropped++;
-    return false;
-  }
-  reportsQueued++;
-  return true;
+  return queuePacket(packet);
 }
 
 void queueReceiverSwitch(uint8_t receiverId) {
-  if (!hidPacketQueue || receiverId < 1 || receiverId > RECEIVER_COUNT) return;
+  if (receiverId < 1 || receiverId > RECEIVER_COUNT) return;
   HidPacket packet = {};
   packet.version = PROTOCOL_VERSION;
   packet.type = PACKET_SWITCH_RECEIVER;
   packet.reportLength = 1;
   packet.data[0] = receiverId;
-  if (xQueueSend(hidPacketQueue, &packet, 0) != pdTRUE) reportsDropped++;
+  queuePacket(packet);
+}
+
+// All ESP-NOW sends, including neutral reports and receiver-state broadcasts,
+// are serialized by the ESP-NOW worker task.
+bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
+  if (!sendDoneSemaphore) return false;
+
+  for (uint8_t attempt = 0; attempt < 4; attempt++) {
+    while (xSemaphoreTake(sendDoneSemaphore, 0) == pdTRUE) {}
+    sendCallbackSuccess = false;
+
+    esp_err_t err = esp_now_send(mac, (const uint8_t*)&packet, sizeof(packet));
+    if (err != ESP_OK) {
+      sendFailures++;
+      if (attempt < 3) {
+        sendRetries++;
+        vTaskDelay(pdMS_TO_TICKS(2 + attempt * 3));
+        continue;
+      }
+      Serial.printf("[ESPNOW] send call failed: %d\n", (int)err);
+      return false;
+    }
+
+    // Never submit another packet until this send has completed.
+    if (xSemaphoreTake(sendDoneSemaphore, pdMS_TO_TICKS(100)) != pdTRUE) {
+      sendFailures++;
+      if (attempt < 3) {
+        sendRetries++;
+        vTaskDelay(pdMS_TO_TICKS(4 + attempt * 4));
+        continue;
+      }
+      Serial.println("[ESPNOW] completion callback timed out");
+      return false;
+    }
+
+    if (sendCallbackSuccess) {
+      reportsSent++;
+      return true;
+    }
+
+    sendFailures++;
+    if (attempt < 3) {
+      sendRetries++;
+      vTaskDelay(pdMS_TO_TICKS(2 + attempt * 3));
+    }
+  }
+  return false;
 }
 
 void sendNeutralKeyboardReport(uint8_t receiverId) {
@@ -152,9 +229,7 @@ void sendNeutralKeyboardReport(uint8_t receiverId) {
   packet.type = PACKET_HID_REPORT;
   packet.reportId = 1;
   packet.reportLength = 8;
-  esp_err_t result = esp_now_send(receiverMacs[receiverId - 1],
-                                  (const uint8_t*)&packet, sizeof(packet));
-  if (result != ESP_OK) Serial.printf("Neutral report error: %d\n", result);
+  sendPacketAndWait(receiverMacs[receiverId - 1], packet);
 }
 
 void broadcastReceiverState() {
@@ -164,37 +239,56 @@ void broadcastReceiverState() {
   packet.reportLength = 1;
   packet.data[0] = activeReceiver;
   for (uint8_t i = 0; i < RECEIVER_COUNT; i++)
-    esp_now_send(receiverMacs[i], (const uint8_t*)&packet, sizeof(packet));
+    sendPacketAndWait(receiverMacs[i], packet);
 }
 
 void processReceiverSwitch(uint8_t receiverId) {
   if (receiverId < 1 || receiverId > RECEIVER_COUNT) return;
-  if (receiverId != activeReceiver) {
-    uint8_t oldReceiver = activeReceiver;
+  uint8_t oldReceiver;
+  portENTER_CRITICAL(&stateMux);
+  oldReceiver = activeReceiver;
+  portEXIT_CRITICAL(&stateMux);
+
+  if (receiverId != oldReceiver) {
     sendNeutralKeyboardReport(oldReceiver);
-    delay(2);
+    portENTER_CRITICAL(&stateMux);
     activeReceiver = receiverId;
+    portEXIT_CRITICAL(&stateMux);
     Serial.printf("\n[KVM] Switched receiver %u -> receiver %u\n",
-                  oldReceiver, activeReceiver);
+                  oldReceiver, receiverId);
   }
   broadcastReceiverState();
 }
 
-void processEspNowQueue() {
-  if (!hidPacketQueue) return;
-  HidPacket packet;
-  while (xQueueReceive(hidPacketQueue, &packet, 0) == pdTRUE) {
-    if (packet.version != PROTOCOL_VERSION) continue;
-    if (packet.type == PACKET_SWITCH_RECEIVER) {
-      if (packet.reportLength >= 1) processReceiverSwitch(packet.data[0]);
-      continue;
+void espNowWorker(void* parameter) {
+  (void)parameter;
+  uint32_t lastBroadcast = millis();
+
+  for (;;) {
+    HidPacket packet;
+    if (xQueueReceive(hidPacketQueue, &packet, pdMS_TO_TICKS(25)) == pdTRUE) {
+      if (packet.version != PROTOCOL_VERSION) continue;
+
+      if (packet.type == PACKET_SWITCH_RECEIVER) {
+        if (packet.reportLength >= 1) processReceiverSwitch(packet.data[0]);
+      } else if (packet.type == PACKET_HID_REPORT &&
+                 packet.reportLength > 0 &&
+                 packet.reportLength <= sizeof(packet.data)) {
+        uint8_t receiver;
+        portENTER_CRITICAL(&stateMux);
+        receiver = activeReceiver;
+        portEXIT_CRITICAL(&stateMux);
+        sendPacketAndWait(receiverMacs[receiver - 1], packet);
+      }
     }
-    if (packet.type != PACKET_HID_REPORT || !packet.reportLength ||
-        packet.reportLength > sizeof(packet.data)) continue;
-    esp_err_t result = esp_now_send(receiverMacs[activeReceiver - 1],
-                                    (const uint8_t*)&packet, sizeof(packet));
-    if (result == ESP_OK) reportsSent++;
-    else Serial.printf("ESP-NOW send error: %d\n", result);
+
+    // Keep receiver indicators refreshed, but serialize these transmissions
+    // with HID traffic rather than sending them from loop() concurrently.
+    uint32_t now = millis();
+    if (now - lastBroadcast >= 2000) {
+      lastBroadcast = now;
+      broadcastReceiverState();
+    }
   }
 }
 
@@ -205,7 +299,9 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
   DeviceRole role = ROLE_KEYBOARD;
   uint8_t reportId = 0;
   bool found = false;
-  for (uint8_t i = 0; i < reportMapCount; i++) {
+
+  uint8_t mapCount = reportMapCount;
+  for (uint8_t i = 0; i < mapCount; i++) {
     if (reportMap[i].characteristic == characteristic &&
         reportMap[i].reportType == 1) {
       role = reportMap[i].role;
@@ -215,11 +311,13 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
     }
   }
   if (!found || !data || !length || length > sizeof(HidPacket::data)) return;
+
   DeviceSlot* slot = slotForRole(role);
   slot->notificationCount++;
 
   if (role == ROLE_KEYBOARD) {
     if (reportId != 1 || length != 8) return;
+
     bool r1 = false, r2 = false;
     for (size_t i = 2; i < 8; i++) {
       if (data[i] == KEY_SWITCH_RECEIVER_1) r1 = true;
@@ -289,14 +387,13 @@ void discoverHID(DeviceSlot& slot, DeviceRole role) {
   unsigned subscribed = 0;
   for (auto* c : characteristics) {
     if (!c || c->getUUID() != NimBLEUUID((uint16_t)HID_REPORT_UUID)) continue;
-    NimBLERemoteDescriptor* ref =
-      c->getDescriptor(NimBLEUUID((uint16_t)0x2908));
+    NimBLERemoteDescriptor* ref = c->getDescriptor(NimBLEUUID((uint16_t)0x2908));
     if (!ref) continue;
     std::string value = ref->readValue();
     if (value.length() != 2) continue;
+
     uint8_t id = (uint8_t)value[0];
     uint8_t type = (uint8_t)value[1];
-
     if (reportMapCount >= sizeof(reportMap) / sizeof(reportMap[0])) {
       Serial.println("WARNING: BLE report map full");
       break;
@@ -307,7 +404,6 @@ void discoverHID(DeviceSlot& slot, DeviceRole role) {
       ((role == ROLE_KEYBOARD && id == 1) ||
        (role == ROLE_MOUSE && id == 2)));
     if (!wanted) continue;
-
     bool ok = c->subscribe(true, hidNotify);
     Serial.printf("[%s] subscribe report ID %u handle %u: %s\n",
       slot.label, id, c->getHandle(), ok ? "OK" : "FAILED");
@@ -356,6 +452,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     bool isKeyboard = nameMatches(device, ROLE_KEYBOARD);
     bool isMouse = nameMatches(device, ROLE_MOUSE);
     if (!isKeyboard && !isMouse) return;
+
     Serial.printf("BLE candidate: %s (%s), RSSI %d\n",
       device->getName().c_str(), device->getAddress().toString().c_str(),
       device->getRSSI());
@@ -394,13 +491,18 @@ void setup() {
   Serial.println(" ESP32-S3 BLE KEYBOARD + MOUSE KVM SENDER");
   Serial.println("========================================");
 
-  if (!initEspNow()) Serial.println("ESP-NOW setup failed; check configuration.");
+  if (!initEspNow()) {
+    Serial.println("ESP-NOW setup failed; check configuration.");
+  } else {
+    BaseType_t taskResult = xTaskCreatePinnedToCore(
+      espNowWorker, "EspNowTx", 4096, nullptr, 3, nullptr, 0);
+    if (taskResult != pdPASS) Serial.println("Failed to create ESP-NOW worker task");
+  }
 
-  NimBLEDevice::init("ESP32-S3 BLE KVM Sender");
+  NimBLEDevice::init("KVM Sender");
   NimBLEDevice::setSecurityAuth(true, false, true);
   Serial.println("BLE initialized; searching for names containing Keychron and M720.");
   startScan();
-  broadcastReceiverState();
 }
 
 void loop() {
@@ -413,9 +515,7 @@ void loop() {
     discoverHID(mouseSlot, ROLE_MOUSE);
   }
 
-  processEspNowQueue();
   uint32_t now = millis();
-
   static uint32_t lastStatus = 0;
   if (now - lastStatus >= 5000) {
     lastStatus = now;
@@ -426,15 +526,10 @@ void loop() {
       mouseSlot.connected ? "connected" : "down",
       mouseSlot.ready ? "ready" : "not-ready",
       (unsigned long)mouseSlot.notificationCount);
-    Serial.printf("[ESPNOW] queued=%lu sent=%lu dropped=%lu activeReceiver=%u\n",
+    Serial.printf("[ESPNOW] queued=%lu sent=%lu dropped=%lu failed=%lu retries=%lu activeReceiver=%u\n",
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
-      (unsigned long)reportsDropped, activeReceiver);
-  }
-
-  static uint32_t lastReceiverBroadcast = 0;
-  if (now - lastReceiverBroadcast >= 2000) {
-    lastReceiverBroadcast = now;
-    broadcastReceiverState();
+      (unsigned long)reportsDropped, (unsigned long)sendFailures,
+      (unsigned long)sendRetries, activeReceiver);
   }
 
   static uint32_t lastScanCheck = 0;
@@ -447,5 +542,5 @@ void loop() {
     NimBLEScan* scan = NimBLEDevice::getScan();
     if ((keyboardMissing || mouseMissing) && scan && !scan->isScanning()) startScan();
   }
-  delay(5);
+  delay(2);
 }
