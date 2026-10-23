@@ -65,8 +65,39 @@ portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t activeReceiver = 1;
 volatile uint32_t reportsQueued = 0, reportsDropped = 0, reportsSent = 0;
 volatile uint32_t sendFailures = 0, sendRetries = 0;
+volatile uint32_t sendCallErrors = 0;
+volatile uint32_t callbackFailures = 0;
+volatile uint32_t callbackTimeouts = 0;
+volatile int32_t lastSendError = 0;
+volatile int32_t lastCallbackStatus = -1;
+volatile uint8_t inFlightType = 0;
+volatile uint8_t inFlightReceiver = 0;
+volatile uint32_t callbackFailHid = 0;
+volatile uint32_t callbackFailSwitch = 0;
+volatile uint32_t callbackFailRx1 = 0;
+volatile uint32_t callbackFailRx2 = 0;
+volatile uint32_t callbackOkHid = 0;
+volatile uint32_t callbackOkSwitch = 0;
+volatile uint32_t callbackOkRx1 = 0;
+volatile uint32_t callbackOkRx2 = 0;
 bool wasReceiver1KeyDown = false, wasReceiver2KeyDown = false;
 volatile bool sendCallbackSuccess = false;
+
+void recordSendCallback(esp_now_send_status_t status) {
+  lastCallbackStatus = (int32_t)status;
+  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackOkSwitch++;
+    else callbackOkHid++;
+    if (inFlightReceiver == 1) callbackOkRx1++;
+    else if (inFlightReceiver == 2) callbackOkRx2++;
+  } else {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackFailSwitch++;
+    else callbackFailHid++;
+    if (inFlightReceiver == 1) callbackFailRx1++;
+    else if (inFlightReceiver == 2) callbackFailRx2++;
+  }
+}
 
 struct ReceiverDiagnostics {
   uint32_t received = 0;
@@ -99,13 +130,13 @@ bool containsIgnoreCase(const std::string& value, const char* needle) {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
   (void)txInfo;
-  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  recordSendCallback(status);
   if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
 }
 #else
 void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
   (void)mac;
-  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  recordSendCallback(status);
   if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
 }
 #endif
@@ -234,10 +265,16 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
   for (uint8_t attempt = 0; attempt < 4; attempt++) {
     while (xSemaphoreTake(sendDoneSemaphore, 0) == pdTRUE) {}
     sendCallbackSuccess = false;
+    inFlightType = packet.type;
+    inFlightReceiver = (mac[0] == receiverMacs[0][0] &&
+                        memcmp(mac, receiverMacs[0], 6) == 0) ? 1 :
+                       ((memcmp(mac, receiverMacs[1], 6) == 0) ? 2 : 0);
 
     esp_err_t err = esp_now_send(mac, (const uint8_t*)&packet, sizeof(packet));
     if (err != ESP_OK) {
       sendFailures++;
+      sendCallErrors++;
+      lastSendError = (int32_t)err;
       if (attempt < 3) {
         sendRetries++;
         vTaskDelay(pdMS_TO_TICKS(2 + attempt * 3));
@@ -250,6 +287,7 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
     // Never submit another packet until this send has completed.
     if (xSemaphoreTake(sendDoneSemaphore, pdMS_TO_TICKS(100)) != pdTRUE) {
       sendFailures++;
+      callbackTimeouts++;
       if (attempt < 3) {
         sendRetries++;
         vTaskDelay(pdMS_TO_TICKS(4 + attempt * 4));
@@ -265,6 +303,7 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
     }
 
     sendFailures++;
+    callbackFailures++;
     if (attempt < 3) {
       sendRetries++;
       vTaskDelay(pdMS_TO_TICKS(2 + attempt * 3));
@@ -610,6 +649,16 @@ void loop() {
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
       (unsigned long)reportsDropped, (unsigned long)sendFailures,
       (unsigned long)sendRetries, activeReceiver);
+    Serial.printf("[TX DETAIL] callErrors=%lu lastErr=%ld callbackFails=%lu lastCbStatus=%ld timeouts=%lu\\n",
+      (unsigned long)sendCallErrors, (long)lastSendError,
+      (unsigned long)callbackFailures, (long)lastCallbackStatus,
+      (unsigned long)callbackTimeouts);
+    Serial.printf("[TX BY TYPE] HID ok=%lu fail=%lu | SWITCH ok=%lu fail=%lu\\n",
+      (unsigned long)callbackOkHid, (unsigned long)callbackFailHid,
+      (unsigned long)callbackOkSwitch, (unsigned long)callbackFailSwitch);
+    Serial.printf("[TX BY RX] RX1 ok=%lu fail=%lu | RX2 ok=%lu fail=%lu\\n",
+      (unsigned long)callbackOkRx1, (unsigned long)callbackFailRx1,
+      (unsigned long)callbackOkRx2, (unsigned long)callbackFailRx2);
     printReceiverDiagnostics();
   }
 
