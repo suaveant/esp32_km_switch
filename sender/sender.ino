@@ -15,7 +15,7 @@
 
 // Diagnostic mode: count real M720 BLE reports but discard their movement data,
 // while sending synthetic circular mouse movement through ESP-NOW at 125 Hz.
-static constexpr bool TEST_SYNTHETIC_WITH_BLE = true;
+static constexpr bool TEST_SYNTHETIC_WITH_BLE = false;
 static constexpr uint32_t SYNTHETIC_INTERVAL_US = 8000;
 static constexpr uint32_t SYNTHETIC_DURATION_MS = 300000; // 5 minutes
 static constexpr float SYNTHETIC_TWO_PI = 6.28318530718f;
@@ -111,6 +111,7 @@ void recordSendCallback(esp_now_send_status_t status) {
   }
 }
 
+
 struct ReceiverDiagnostics {
   uint32_t received = 0;
   uint32_t keyboard = 0;
@@ -118,6 +119,8 @@ struct ReceiverDiagnostics {
   uint32_t bad = 0;
   uint32_t queueDrops = 0;
   uint32_t switches = 0;
+  uint32_t maxQueueDepth = 0;
+  uint32_t maxHidTaskUs = 0;
   uint32_t lastUpdateMs = 0;
 };
 ReceiverDiagnostics receiverDiag[RECEIVER_COUNT];
@@ -161,7 +164,7 @@ void onEspNowReceived(
   if (!info || !data || len != (int)sizeof(HidPacket)) return;
   if (data[0] != PROTOCOL_VERSION ||
       data[1] != PACKET_DIAGNOSTICS ||
-      data[3] != 24) return;
+      data[3] != 32) return;
 
   int receiverIndex = -1;
   for (uint8_t i = 0; i < RECEIVER_COUNT; ++i) {
@@ -172,7 +175,7 @@ void onEspNowReceived(
   }
   if (receiverIndex < 0) return;
 
-  uint32_t counters[6];
+  uint32_t counters[8];
   memcpy(counters, data + 4, sizeof(counters));
 
   portENTER_CRITICAL(&diagnosticsMux);
@@ -182,6 +185,8 @@ void onEspNowReceived(
   receiverDiag[receiverIndex].bad = counters[3];
   receiverDiag[receiverIndex].queueDrops = counters[4];
   receiverDiag[receiverIndex].switches = counters[5];
+  receiverDiag[receiverIndex].maxQueueDepth = counters[6];
+  receiverDiag[receiverIndex].maxHidTaskUs = counters[7];
   receiverDiag[receiverIndex].lastUpdateMs = millis();
   portEXIT_CRITICAL(&diagnosticsMux);
 }
@@ -626,7 +631,7 @@ void printReceiverDiagnostics() {
     }
 
     Serial.printf(
-      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu\n",
+      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu max_q=%lu max_hid_us=%lu\n",
       i + 1,
       (unsigned long)(now - d.lastUpdateMs),
       (unsigned long)d.received,
@@ -634,7 +639,9 @@ void printReceiverDiagnostics() {
       (unsigned long)d.mouse,
       (unsigned long)d.bad,
       (unsigned long)d.queueDrops,
-      (unsigned long)d.switches
+      (unsigned long)d.switches,
+      (unsigned long)receiverDiag[i].maxQueueDepth,
+      (unsigned long)receiverDiag[i].maxHidTaskUs
     );
   }
 }

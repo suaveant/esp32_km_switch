@@ -642,7 +642,7 @@ void loop() {
       (unsigned long)hidTaskMaxRunUs
     );
   }
-oo
+
   ensureSenderPeer();
 
   if (now - lastDiagnosticsSent >= DIAGNOSTICS_INTERVAL_MS) {
