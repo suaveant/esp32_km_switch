@@ -208,25 +208,9 @@ void processMouseReport(
   int8_t wheel = (int8_t)payload[5];
   int8_t pan = (int8_t)payload[6];
 
-  int8_t dx;
-  int8_t dy;
 
-  if (x > 127) {
-    dx = 127;
-  } else if (x < -127) {
-    dx = -127;
-  } else {
-    dx = (int8_t)x;
-  }
-
-  if (y > 127) {
-    dy = 127;
-  } else if (y < -127) {
-    dy = -127;
-  } else {
-    dy = (int8_t)y;
-  }
-
+  // Keep the full decoded movement instead of clamping and losing
+  // everything beyond the USB mouse API's signed 8-bit range.
   static uint8_t previousButtons = 0;
 
   if (buttons != previousButtons) {
@@ -234,7 +218,29 @@ void processMouseReport(
     previousButtons = buttons;
   }
 
-  mouse.move(dx, dy, wheel, pan);
+  bool firstChunk = true;
+
+  while (x != 0 || y != 0) {
+    int8_t dx = (x > 127) ? 127 : (x < -127) ? -127 : (int8_t)x;
+    int8_t dy = (y > 127) ? 127 : (y < -127) ? -127 : (int8_t)y;
+
+    mouse.move(
+      dx,
+      dy,
+      firstChunk ? wheel : 0,
+      firstChunk ? pan : 0
+    );
+
+    x -= dx;
+    y -= dy;
+    firstChunk = false;
+  }
+
+  // Still send scroll-only reports when there is no X/Y movement.
+  if (firstChunk && (wheel != 0 || pan != 0)) {
+    mouse.move(0, 0, wheel, pan);
+  }
+
   mouseCount++;
 }
 
