@@ -5,20 +5,12 @@
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
 #include <cstring>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/queue.h"fg
 #include "freertos/semphr.h"
 
 #define HID_SERVICE_UUID 0x1812
 #define HID_REPORT_UUID  0x2A4D
-
-// Diagnostic mode: count real M720 BLE reports but discard their movement data,
-// while sending synthetic circular mouse movement through ESP-NOW at 125 Hz.
-static constexpr bool TEST_SYNTHETIC_WITH_BLE = false;
-static constexpr uint32_t SYNTHETIC_INTERVAL_US = 8000;
-static constexpr uint32_t SYNTHETIC_DURATION_MS = 300000; // 5 minutes
-static constexpr float SYNTHETIC_TWO_PI = 6.28318530718f;
 
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
 static constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -28,6 +20,7 @@ static constexpr uint8_t PACKET_SWITCH_RECEIVER = 2;
 static constexpr uint8_t PACKET_DIAGNOSTICS = 3;
 static constexpr uint8_t KEY_SWITCH_RECEIVER_1 = 0x6B; // F16
 static constexpr uint8_t KEY_SWITCH_RECEIVER_2 = 0x6A; // F15
+static constexpr uint32_t PROFILE_INTERVAL_MS = 2000;
 
 uint8_t receiverMacs[RECEIVER_COUNT][6] = {
   {0x90, 0xDA, 0x72, 0x73, 0x4C, 0x18},
@@ -42,6 +35,12 @@ struct __attribute__((packed)) HidPacket {
   uint8_t data[32];
 };
 static_assert(sizeof(HidPacket) == 36, "Unexpected HidPacket size");
+
+// Queue metadata is local-only; the transmitted packet remains 36 bytes.
+struct QueuedPacket {
+  HidPacket packet;
+  uint32_t queuedUs;
+};
 
 enum DeviceRole : uint8_t { ROLE_KEYBOARD = 0, ROLE_MOUSE = 1 };
 
@@ -73,10 +72,6 @@ portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t activeReceiver = 1;
 volatile uint32_t reportsQueued = 0, reportsDropped = 0, reportsSent = 0;
 volatile uint32_t sendFailures = 0, sendRetries = 0;
-volatile uint32_t mouseReportsDiscardedForTest = 0;
-volatile uint32_t syntheticReportsGenerated = 0;
-volatile uint32_t syntheticReportsQueued = 0;
-volatile uint32_t syntheticReportsQueueDrops = 0;
 volatile uint32_t sendCallErrors = 0;
 volatile uint32_t callbackFailures = 0;
 volatile uint32_t callbackTimeouts = 0;
@@ -95,22 +90,68 @@ volatile uint32_t callbackOkRx2 = 0;
 bool wasReceiver1KeyDown = false, wasReceiver2KeyDown = false;
 volatile bool sendCallbackSuccess = false;
 
-void recordSendCallback(esp_now_send_status_t status) {
-  lastCallbackStatus = (int32_t)status;
-  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackOkSwitch++;
-    else callbackOkHid++;
-    if (inFlightReceiver == 1) callbackOkRx1++;
-    else if (inFlightReceiver == 2) callbackOkRx2++;
-  } else {
-    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackFailSwitch++;
-    else callbackFailHid++;
-    if (inFlightReceiver == 1) callbackFailRx1++;
-    else if (inFlightReceiver == 2) callbackFailRx2++;
+// ---------------- Low-overhead profiling ----------------
+// Buckets: <100us, 100-500us, 500-1000us, 1-2ms, 2-5ms, >=5ms.
+enum ProfileId : uint8_t {
+  PROF_BLE_CALLBACK = 0,
+  PROF_KEYBOARD_INTERVAL,
+  PROF_MOUSE_INTERVAL,
+  PROF_QUEUE_WAIT,
+  PROF_SEND_COMPLETION,
+  PROF_SEND_CALL,
+  PROF_COUNT
+};
+static const char* const profileNames[PROF_COUNT] = {
+  "ble_cb", "kbd_interval", "mouse_interval", "queue_wait", "send_complete", "send_call"
+};
+struct ProfileStats {
+  uint32_t count;
+  uint64_t totalUs;
+  uint32_t maxUs;
+  uint32_t buckets[6];
+};
+ProfileStats profileStats[PROF_COUNT] = {};
+portMUX_TYPE profileMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t lastBleUs[2] = {0, 0};
+volatile uint32_t lastSendStartUs = 0;
+
+static uint8_t profileBucket(uint32_t us) {
+  if (us < 100) return 0;
+  if (us < 500) return 1;
+  if (us < 1000) return 2;
+  if (us < 2000) return 3;
+  if (us < 5000) return 4;
+  return 5;
+}
+static void profileRecord(ProfileId id, uint32_t elapsedUs) {
+  if (id >= PROF_COUNT) return;
+  portENTER_CRITICAL(&profileMux);
+  ProfileStats& s = profileStats[id];
+  s.count++;
+  s.totalUs += elapsedUs;
+  if (elapsedUs > s.maxUs) s.maxUs = elapsedUs;
+  s.buckets[profileBucket(elapsedUs)]++;
+  portEXIT_CRITICAL(&profileMux);
+}
+static void profilePrintAndReset() {
+  ProfileStats snap[PROF_COUNT];
+  portENTER_CRITICAL(&profileMux);
+  memcpy(snap, profileStats, sizeof(snap));
+  memset(profileStats, 0, sizeof(profileStats));
+  portEXIT_CRITICAL(&profileMux);
+
+  Serial.println("[PROFILE] window=2s; buckets=<100,100-500,500-1k,1-2k,2-5k,>=5k us");
+  for (uint8_t i = 0; i < PROF_COUNT; ++i) {
+    const ProfileStats& s = snap[i];
+    if (!s.count) continue;
+    Serial.printf("[PROFILE] %s n=%lu avg=%luus max=%luus hist=%lu,%lu,%lu,%lu,%lu,%lu\n",
+      profileNames[i], (unsigned long)s.count,
+      (unsigned long)(s.totalUs / s.count), (unsigned long)s.maxUs,
+      (unsigned long)s.buckets[0], (unsigned long)s.buckets[1],
+      (unsigned long)s.buckets[2], (unsigned long)s.buckets[3],
+      (unsigned long)s.buckets[4], (unsigned long)s.buckets[5]);
   }
 }
-
 
 struct ReceiverDiagnostics {
   uint32_t received = 0;
@@ -119,8 +160,6 @@ struct ReceiverDiagnostics {
   uint32_t bad = 0;
   uint32_t queueDrops = 0;
   uint32_t switches = 0;
-  uint32_t maxQueueDepth = 0;
-  uint32_t maxHidTaskUs = 0;
   uint32_t lastUpdateMs = 0;
 };
 ReceiverDiagnostics receiverDiag[RECEIVER_COUNT];
@@ -145,13 +184,43 @@ bool containsIgnoreCase(const std::string& value, const char* needle) {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 void onEspNowSent(const wifi_tx_info_t* txInfo, esp_now_send_status_t status) {
   (void)txInfo;
-  recordSendCallback(status);
+  const uint32_t callbackUs = micros();
+  const uint32_t startedUs = lastSendStartUs;
+  if (startedUs) profileRecord(PROF_SEND_COMPLETION, callbackUs - startedUs);
+  lastCallbackStatus = (int32_t)status;
+  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackOkSwitch++;
+    else callbackOkHid++;
+    if (inFlightReceiver == 1) callbackOkRx1++;
+    else if (inFlightReceiver == 2) callbackOkRx2++;
+  } else {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackFailSwitch++;
+    else callbackFailHid++;
+    if (inFlightReceiver == 1) callbackFailRx1++;
+    else if (inFlightReceiver == 2) callbackFailRx2++;
+  }
   if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
 }
 #else
 void onEspNowSent(const uint8_t* mac, esp_now_send_status_t status) {
   (void)mac;
-  recordSendCallback(status);
+  const uint32_t callbackUs = micros();
+  const uint32_t startedUs = lastSendStartUs;
+  if (startedUs) profileRecord(PROF_SEND_COMPLETION, callbackUs - startedUs);
+  lastCallbackStatus = (int32_t)status;
+  sendCallbackSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackOkSwitch++;
+    else callbackOkHid++;
+    if (inFlightReceiver == 1) callbackOkRx1++;
+    else if (inFlightReceiver == 2) callbackOkRx2++;
+  } else {
+    if (inFlightType == PACKET_SWITCH_RECEIVER) callbackFailSwitch++;
+    else callbackFailHid++;
+    if (inFlightReceiver == 1) callbackFailRx1++;
+    else if (inFlightReceiver == 2) callbackFailRx2++;
+  }
   if (sendDoneSemaphore) xSemaphoreGive(sendDoneSemaphore);
 }
 #endif
@@ -164,7 +233,7 @@ void onEspNowReceived(
   if (!info || !data || len != (int)sizeof(HidPacket)) return;
   if (data[0] != PROTOCOL_VERSION ||
       data[1] != PACKET_DIAGNOSTICS ||
-      data[3] != 32) return;
+      data[3] != 24) return;
 
   int receiverIndex = -1;
   for (uint8_t i = 0; i < RECEIVER_COUNT; ++i) {
@@ -175,7 +244,7 @@ void onEspNowReceived(
   }
   if (receiverIndex < 0) return;
 
-  uint32_t counters[8];
+  uint32_t counters[6];
   memcpy(counters, data + 4, sizeof(counters));
 
   portENTER_CRITICAL(&diagnosticsMux);
@@ -185,8 +254,6 @@ void onEspNowReceived(
   receiverDiag[receiverIndex].bad = counters[3];
   receiverDiag[receiverIndex].queueDrops = counters[4];
   receiverDiag[receiverIndex].switches = counters[5];
-  receiverDiag[receiverIndex].maxQueueDepth = counters[6];
-  receiverDiag[receiverIndex].maxHidTaskUs = counters[7];
   receiverDiag[receiverIndex].lastUpdateMs = millis();
   portEXIT_CRITICAL(&diagnosticsMux);
 }
@@ -224,7 +291,7 @@ bool initEspNow() {
     Serial.printf("Added ESP-NOW receiver %u\n", i + 1);
   }
 
-  hidPacketQueue = xQueueCreate(64, sizeof(HidPacket));
+  hidPacketQueue = xQueueCreate(64, sizeof(QueuedPacket));
   sendDoneSemaphore = xSemaphoreCreateBinary();
   if (!hidPacketQueue || !sendDoneSemaphore) {
     Serial.println("Could not create ESP-NOW queue/semaphore");
@@ -240,9 +307,10 @@ bool queuePacket(const HidPacket& packet) {
     reportsDropped++;
     return false;
   }
-  if (xQueueSend(hidPacketQueue, &packet, 0) != pdTRUE) {
-    // Keep the input callback non-blocking. Queue depth is deliberately larger
-    // than before; overflow is counted so it is visible in serial diagnostics.
+  QueuedPacket queued = {};
+  queued.packet = packet;
+  queued.queuedUs = micros();
+  if (xQueueSend(hidPacketQueue, &queued, 0) != pdTRUE) {
     reportsDropped++;
     return false;
   }
@@ -264,29 +332,6 @@ bool queueHidReport(uint8_t reportId, const uint8_t* data, size_t length) {
   return queuePacket(packet);
 }
 
-void encodeSyntheticMouseDelta(int16_t dx, int16_t dy, uint8_t* p) {
-  uint16_t x = (uint16_t)dx & 0x0FFF;
-  uint16_t y = (uint16_t)dy & 0x0FFF;
-  p[0] = 0;
-  p[1] = 0;
-  p[2] = x & 0xFF;
-  p[3] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4);
-  p[4] = (y >> 4) & 0xFF;
-  p[5] = 0;
-  p[6] = 0;
-}
-
-void generateSyntheticMouseReport(uint32_t index) {
-  const float phase = SYNTHETIC_TWO_PI * ((float)(index % 250) / 250.0f);
-  const int16_t dx = (int16_t)lroundf(4.0f * cosf(phase));
-  const int16_t dy = (int16_t)lroundf(4.0f * sinf(phase));
-  uint8_t data[7];
-  encodeSyntheticMouseDelta(dx, dy, data);
-  syntheticReportsGenerated++;
-  if (queueHidReport(2, data, sizeof(data))) syntheticReportsQueued++;
-  else syntheticReportsQueueDrops++;
-}
-
 void queueReceiverSwitch(uint8_t receiverId) {
   if (receiverId < 1 || receiverId > RECEIVER_COUNT) return;
   HidPacket packet = {};
@@ -306,12 +351,16 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
     while (xSemaphoreTake(sendDoneSemaphore, 0) == pdTRUE) {}
     sendCallbackSuccess = false;
     inFlightType = packet.type;
-    inFlightReceiver = (mac[0] == receiverMacs[0][0] &&
-                        memcmp(mac, receiverMacs[0], 6) == 0) ? 1 :
+    inFlightReceiver = (memcmp(mac, receiverMacs[0], 6) == 0) ? 1 :
                        ((memcmp(mac, receiverMacs[1], 6) == 0) ? 2 : 0);
 
+    const uint32_t sendStartUs = micros();
+    lastSendStartUs = sendStartUs;
     esp_err_t err = esp_now_send(mac, (const uint8_t*)&packet, sizeof(packet));
+    const uint32_t sendCallElapsedUs = micros() - sendStartUs;
+    profileRecord(PROF_SEND_CALL, sendCallElapsedUs);
     if (err != ESP_OK) {
+      lastSendStartUs = 0;
       sendFailures++;
       sendCallErrors++;
       lastSendError = (int32_t)err;
@@ -326,6 +375,7 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
 
     // Never submit another packet until this send has completed.
     if (xSemaphoreTake(sendDoneSemaphore, pdMS_TO_TICKS(100)) != pdTRUE) {
+      lastSendStartUs = 0;
       sendFailures++;
       callbackTimeouts++;
       if (attempt < 3) {
@@ -336,6 +386,7 @@ bool sendPacketAndWait(const uint8_t* mac, const HidPacket& packet) {
       Serial.println("[ESPNOW] completion callback timed out");
       return false;
     }
+    lastSendStartUs = 0;
 
     if (sendCallbackSuccess) {
       reportsSent++;
@@ -392,9 +443,14 @@ void processReceiverSwitch(uint8_t receiverId) {
 
 void espNowWorker(void* parameter) {
   (void)parameter;
+  uint32_t lastBroadcast = millis();
+
   for (;;) {
-    HidPacket packet;
-    if (xQueueReceive(hidPacketQueue, &packet, pdMS_TO_TICKS(25)) == pdTRUE) {
+    QueuedPacket queued;
+    if (xQueueReceive(hidPacketQueue, &queued, pdMS_TO_TICKS(25)) == pdTRUE) {
+      const uint32_t queueWaitUs = micros() - queued.queuedUs;
+      profileRecord(PROF_QUEUE_WAIT, queueWaitUs);
+      HidPacket& packet = queued.packet;
       if (packet.version != PROTOCOL_VERSION) continue;
 
       if (packet.type == PACKET_SWITCH_RECEIVER) {
@@ -410,15 +466,20 @@ void espNowWorker(void* parameter) {
       }
     }
 
-    // IMPORTANT TEST MODE: do not periodically broadcast receiver state.
-    // Those packets were dominating the ESP-NOW link (roughly 4 failures
-    // for every successful SWITCH packet) and can interfere with HID timing.
+    // Keep receiver indicators refreshed, but serialize these transmissions
+    // with HID traffic rather than sending them from loop() concurrently.
+    uint32_t now = millis();
+    if (now - lastBroadcast >= 2000) {
+      lastBroadcast = now;
+      broadcastReceiverState();
+    }
   }
 }
 
 // ---------------- BLE HID notifications ----------------
 void hidNotify(NimBLERemoteCharacteristic* characteristic,
                uint8_t* data, size_t length, bool isNotify) {
+  const uint32_t callbackStartUs = micros();
   (void)isNotify;
   DeviceRole role = ROLE_KEYBOARD;
   uint8_t reportId = 0;
@@ -434,13 +495,27 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
       break;
     }
   }
-  if (!found || !data || !length || length > sizeof(HidPacket::data)) return;
+  if (!found || !data || !length || length > sizeof(HidPacket::data)) {
+    profileRecord(PROF_BLE_CALLBACK, micros() - callbackStartUs);
+    return;
+  }
 
   DeviceSlot* slot = slotForRole(role);
   slot->notificationCount++;
+  const uint8_t roleIndex = (role == ROLE_KEYBOARD) ? 0 : 1;
+  const uint32_t nowUs = micros();
+  const uint32_t previousUs = lastBleUs[roleIndex];
+  if (previousUs != 0) {
+    profileRecord(role == ROLE_KEYBOARD ? PROF_KEYBOARD_INTERVAL : PROF_MOUSE_INTERVAL,
+                  nowUs - previousUs);
+  }
+  lastBleUs[roleIndex] = nowUs;
 
   if (role == ROLE_KEYBOARD) {
-    if (reportId != 1 || length != 8) return;
+    if (reportId != 1 || length != 8) {
+      profileRecord(PROF_BLE_CALLBACK, micros() - callbackStartUs);
+      return;
+    }
 
     bool r1 = false, r2 = false;
     for (size_t i = 2; i < 8; i++) {
@@ -461,21 +536,13 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
     queueHidReport(1, filtered, sizeof(filtered));
   } else {
     // M720 report ID 2 is 7 bytes; ignore vendor-specific report ID 17.
-    if (reportId == 2 && length == 7) {
-      if (TEST_SYNTHETIC_WITH_BLE) {
-        // Count the notification, but deliberately discard real movement.
-        mouseReportsDiscardedForTest++;
-      } else {
-        queueHidReport(2, data, length);
-      }
-    }
+    if (reportId == 2 && length == 7) queueHidReport(2, data, length);
   }
 
-  // Avoid per-notification mouse serial output during timing test; USB/serial
-  // logging can perturb the very loop timing we are trying to measure.
-  if (role == ROLE_KEYBOARD && (slot->notificationCount % 50) == 1)
+  if ((slot->notificationCount % 50) == 1)
     Serial.printf("[%s] reports=%lu reportId=%u length=%u\n", slot->label,
       (unsigned long)slot->notificationCount, reportId, (unsigned)length);
+  profileRecord(PROF_BLE_CALLBACK, micros() - callbackStartUs);
 }
 
 class SlotClientCallbacks : public NimBLEClientCallbacks {
@@ -631,7 +698,7 @@ void printReceiverDiagnostics() {
     }
 
     Serial.printf(
-      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu max_q=%lu max_hid_us=%lu\n",
+      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu\n",
       i + 1,
       (unsigned long)(now - d.lastUpdateMs),
       (unsigned long)d.received,
@@ -639,9 +706,7 @@ void printReceiverDiagnostics() {
       (unsigned long)d.mouse,
       (unsigned long)d.bad,
       (unsigned long)d.queueDrops,
-      (unsigned long)d.switches,
-      (unsigned long)receiverDiag[i].maxQueueDepth,
-      (unsigned long)receiverDiag[i].maxHidTaskUs
+      (unsigned long)d.switches
     );
   }
 }
@@ -654,13 +719,6 @@ void setup() {
   Serial.println("========================================");
   Serial.println(" ESP32-S3 BLE KEYBOARD + MOUSE KVM SENDER");
   Serial.println("========================================");
-  if (TEST_SYNTHETIC_WITH_BLE) {
-    Serial.println("[TEST] Synthetic mouse + BLE M720 report counting");
-    Serial.println("[TEST] Real M720 movement data will be discarded.");
-    Serial.println("[TEST] Synthetic reports run for 5 minutes at 125 Hz.");
-  } else {
-    Serial.println("[TEST] Normal BLE mouse forwarding mode.");
-  }
 
   if (!initEspNow()) {
     Serial.println("ESP-NOW setup failed; check configuration.");
@@ -687,38 +745,6 @@ void loop() {
   }
 
   uint32_t now = millis();
-
-  // Synthetic reports use the existing queue and ESP-NOW worker.
-  if (TEST_SYNTHETIC_WITH_BLE) {
-    static bool syntheticStarted = false;
-    static bool syntheticFinished = false;
-    static uint32_t syntheticStartMs = 0;
-    static uint32_t nextSyntheticUs = 0;
-
-    if (!syntheticStarted) {
-      syntheticStarted = true;
-      syntheticStartMs = now;
-      nextSyntheticUs = micros();
-      Serial.println("[TEST] 5-minute synthetic stream started.");
-    }
-
-    if (!syntheticFinished && (uint32_t)(now - syntheticStartMs) >= SYNTHETIC_DURATION_MS) {
-      syntheticFinished = true;
-      Serial.println("[TEST] Synthetic stream finished; BLE report counting continues.");
-    }
-
-    if (!syntheticFinished) {
-      uint32_t nowUs = micros();
-      if ((int32_t)(nowUs - nextSyntheticUs) >= 0) {
-        generateSyntheticMouseReport(syntheticReportsGenerated);
-        nextSyntheticUs += SYNTHETIC_INTERVAL_US;
-        if ((int32_t)(nowUs - nextSyntheticUs) >= (int32_t)SYNTHETIC_INTERVAL_US) {
-          nextSyntheticUs = nowUs + SYNTHETIC_INTERVAL_US;
-        }
-      }
-    }
-  }
-
   static uint32_t lastStatus = 0;
   if (now - lastStatus >= 5000) {
     lastStatus = now;
@@ -729,13 +755,6 @@ void loop() {
       mouseSlot.connected ? "connected" : "down",
       mouseSlot.ready ? "ready" : "not-ready",
       (unsigned long)mouseSlot.notificationCount);
-    if (TEST_SYNTHETIC_WITH_BLE) {
-      Serial.printf("[SYNTHETIC TEST] generated=%lu queued=%lu queueDrops=%lu | realM720ReportsReadAndDiscarded=%lu\n",
-        (unsigned long)syntheticReportsGenerated,
-        (unsigned long)syntheticReportsQueued,
-        (unsigned long)syntheticReportsQueueDrops,
-        (unsigned long)mouseReportsDiscardedForTest);
-    }
     Serial.printf("[ESPNOW] queued=%lu sent=%lu dropped=%lu failed=%lu retries=%lu activeReceiver=%u\n",
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
       (unsigned long)reportsDropped, (unsigned long)sendFailures,
@@ -753,8 +772,14 @@ void loop() {
     printReceiverDiagnostics();
   }
 
+  static uint32_t lastProfile = 0;
+  if (now - lastProfile >= PROFILE_INTERVAL_MS) {
+    lastProfile = now;
+    profilePrintAndReset();
+  }
+
   static uint32_t lastScanCheck = 0;
-  if (!TEST_SYNTHETIC_WITH_BLE && now - lastScanCheck >= 3000) {
+  if (now - lastScanCheck >= 3000) {
     lastScanCheck = now;
     bool keyboardMissing = !keyboardSlot.client ||
       (!keyboardSlot.client->isConnected() && !keyboardSlot.connected);
@@ -763,6 +788,5 @@ void loop() {
     NimBLEScan* scan = NimBLEDevice::getScan();
     if ((keyboardMissing || mouseMissing) && scan && !scan->isScanning()) startScan();
   }
-  // No delay here: keep the main loop available for BLE and timing work.
-  yield();
+  delay(2);
 }

@@ -8,7 +8,7 @@
 #include <cstring>
 #include <Adafruit_NeoPixel.h>
 
-#define RECEIVER_ID 1  // Change to 2 on the second receiver
+#define RECEIVER_ID 2  // Change to 2 on the second receiver
 
 Adafruit_NeoPixel pixel(1, 48, NEO_GRB + NEO_KHZ800);
 
