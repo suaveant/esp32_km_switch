@@ -17,7 +17,7 @@
 // while sending synthetic circular mouse movement through ESP-NOW at 125 Hz.
 static constexpr bool TEST_SYNTHETIC_WITH_BLE = true;
 static constexpr uint32_t SYNTHETIC_INTERVAL_US = 8000;
-static constexpr uint32_t SYNTHETIC_DURATION_MS = 30000;
+static constexpr uint32_t SYNTHETIC_DURATION_MS = 300000; // 5 minutes
 static constexpr float SYNTHETIC_TWO_PI = 6.28318530718f;
 
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
@@ -200,7 +200,7 @@ bool initEspNow() {
   esp_now_register_send_cb(onEspNowSent);
   err = esp_now_register_recv_cb(onEspNowReceived);
   if (err != ESP_OK) {
-    Serial.printf("ESP-NOW receive callback registration failed: %d\\n", (int)err);
+    Serial.printf("ESP-NOW receive callback registration failed: %d\n", (int)err);
     return false;
   }
 
@@ -387,8 +387,6 @@ void processReceiverSwitch(uint8_t receiverId) {
 
 void espNowWorker(void* parameter) {
   (void)parameter;
-  uint32_t lastBroadcast = millis();
-
   for (;;) {
     HidPacket packet;
     if (xQueueReceive(hidPacketQueue, &packet, pdMS_TO_TICKS(25)) == pdTRUE) {
@@ -407,13 +405,9 @@ void espNowWorker(void* parameter) {
       }
     }
 
-    // Keep receiver indicators refreshed, but serialize these transmissions
-    // with HID traffic rather than sending them from loop() concurrently.
-    uint32_t now = millis();
-    if (now - lastBroadcast >= 2000) {
-      lastBroadcast = now;
-      broadcastReceiverState();
-    }
+    // IMPORTANT TEST MODE: do not periodically broadcast receiver state.
+    // Those packets were dominating the ESP-NOW link (roughly 4 failures
+    // for every successful SWITCH packet) and can interfere with HID timing.
   }
 }
 
@@ -472,7 +466,9 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
     }
   }
 
-  if ((slot->notificationCount % 50) == 1)
+  // Avoid per-notification mouse serial output during timing test; USB/serial
+  // logging can perturb the very loop timing we are trying to measure.
+  if (role == ROLE_KEYBOARD && (slot->notificationCount % 50) == 1)
     Serial.printf("[%s] reports=%lu reportId=%u length=%u\n", slot->label,
       (unsigned long)slot->notificationCount, reportId, (unsigned)length);
 }
@@ -625,12 +621,12 @@ void printReceiverDiagnostics() {
   for (uint8_t i = 0; i < RECEIVER_COUNT; ++i) {
     const ReceiverDiagnostics& d = snapshot[i];
     if (d.lastUpdateMs == 0) {
-      Serial.printf("[RX%u DIAG] waiting for first report\\n", i + 1);
+      Serial.printf("[RX%u DIAG] waiting for first report\n", i + 1);
       continue;
     }
 
     Serial.printf(
-      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu\\n",
+      "[RX%u DIAG] age=%lums packets=%lu keys=%lu mouse=%lu bad=%lu queueDrops=%lu switches=%lu\n",
       i + 1,
       (unsigned long)(now - d.lastUpdateMs),
       (unsigned long)d.received,
@@ -654,7 +650,7 @@ void setup() {
   if (TEST_SYNTHETIC_WITH_BLE) {
     Serial.println("[TEST] Synthetic mouse + BLE M720 report counting");
     Serial.println("[TEST] Real M720 movement data will be discarded.");
-    Serial.println("[TEST] Synthetic reports run for 30 seconds at 125 Hz.");
+    Serial.println("[TEST] Synthetic reports run for 5 minutes at 125 Hz.");
   } else {
     Serial.println("[TEST] Normal BLE mouse forwarding mode.");
   }
@@ -696,7 +692,7 @@ void loop() {
       syntheticStarted = true;
       syntheticStartMs = now;
       nextSyntheticUs = micros();
-      Serial.println("[TEST] 30-second synthetic stream started.");
+      Serial.println("[TEST] 5-minute synthetic stream started.");
     }
 
     if (!syntheticFinished && (uint32_t)(now - syntheticStartMs) >= SYNTHETIC_DURATION_MS) {
@@ -727,7 +723,7 @@ void loop() {
       mouseSlot.ready ? "ready" : "not-ready",
       (unsigned long)mouseSlot.notificationCount);
     if (TEST_SYNTHETIC_WITH_BLE) {
-      Serial.printf("[SYNTHETIC TEST] generated=%lu queued=%lu queueDrops=%lu | realM720ReportsReadAndDiscarded=%lu\\n",
+      Serial.printf("[SYNTHETIC TEST] generated=%lu queued=%lu queueDrops=%lu | realM720ReportsReadAndDiscarded=%lu\n",
         (unsigned long)syntheticReportsGenerated,
         (unsigned long)syntheticReportsQueued,
         (unsigned long)syntheticReportsQueueDrops,
@@ -737,21 +733,21 @@ void loop() {
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
       (unsigned long)reportsDropped, (unsigned long)sendFailures,
       (unsigned long)sendRetries, activeReceiver);
-    Serial.printf("[TX DETAIL] callErrors=%lu lastErr=%ld callbackFails=%lu lastCbStatus=%ld timeouts=%lu\\n",
+    Serial.printf("[TX DETAIL] callErrors=%lu lastErr=%ld callbackFails=%lu lastCbStatus=%ld timeouts=%lu\n",
       (unsigned long)sendCallErrors, (long)lastSendError,
       (unsigned long)callbackFailures, (long)lastCallbackStatus,
       (unsigned long)callbackTimeouts);
-    Serial.printf("[TX BY TYPE] HID ok=%lu fail=%lu | SWITCH ok=%lu fail=%lu\\n",
+    Serial.printf("[TX BY TYPE] HID ok=%lu fail=%lu | SWITCH ok=%lu fail=%lu\n",
       (unsigned long)callbackOkHid, (unsigned long)callbackFailHid,
       (unsigned long)callbackOkSwitch, (unsigned long)callbackFailSwitch);
-    Serial.printf("[TX BY RX] RX1 ok=%lu fail=%lu | RX2 ok=%lu fail=%lu\\n",
+    Serial.printf("[TX BY RX] RX1 ok=%lu fail=%lu | RX2 ok=%lu fail=%lu\n",
       (unsigned long)callbackOkRx1, (unsigned long)callbackFailRx1,
       (unsigned long)callbackOkRx2, (unsigned long)callbackFailRx2);
     printReceiverDiagnostics();
   }
 
   static uint32_t lastScanCheck = 0;
-  if (now - lastScanCheck >= 3000) {
+  if (!TEST_SYNTHETIC_WITH_BLE && now - lastScanCheck >= 3000) {
     lastScanCheck = now;
     bool keyboardMissing = !keyboardSlot.client ||
       (!keyboardSlot.client->isConnected() && !keyboardSlot.connected);
@@ -760,5 +756,6 @@ void loop() {
     NimBLEScan* scan = NimBLEDevice::getScan();
     if ((keyboardMissing || mouseMissing) && scan && !scan->isScanning()) startScan();
   }
-  delay(2);
+  // No delay here: keep the main loop available for BLE and timing work.
+  yield();
 }
