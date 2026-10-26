@@ -5,12 +5,20 @@
 #include <esp_wifi.h>
 #include <esp_idf_version.h>
 #include <cstring>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
 #define HID_SERVICE_UUID 0x1812
 #define HID_REPORT_UUID  0x2A4D
+
+// Diagnostic mode: count real M720 BLE reports but discard their movement data,
+// while sending synthetic circular mouse movement through ESP-NOW at 125 Hz.
+static constexpr bool TEST_SYNTHETIC_WITH_BLE = true;
+static constexpr uint32_t SYNTHETIC_INTERVAL_US = 8000;
+static constexpr uint32_t SYNTHETIC_DURATION_MS = 30000;
+static constexpr float SYNTHETIC_TWO_PI = 6.28318530718f;
 
 static constexpr uint8_t ESPNOW_CHANNEL = 6;
 static constexpr uint8_t PROTOCOL_VERSION = 1;
@@ -65,6 +73,10 @@ portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t activeReceiver = 1;
 volatile uint32_t reportsQueued = 0, reportsDropped = 0, reportsSent = 0;
 volatile uint32_t sendFailures = 0, sendRetries = 0;
+volatile uint32_t mouseReportsDiscardedForTest = 0;
+volatile uint32_t syntheticReportsGenerated = 0;
+volatile uint32_t syntheticReportsQueued = 0;
+volatile uint32_t syntheticReportsQueueDrops = 0;
 volatile uint32_t sendCallErrors = 0;
 volatile uint32_t callbackFailures = 0;
 volatile uint32_t callbackTimeouts = 0;
@@ -247,6 +259,29 @@ bool queueHidReport(uint8_t reportId, const uint8_t* data, size_t length) {
   return queuePacket(packet);
 }
 
+void encodeSyntheticMouseDelta(int16_t dx, int16_t dy, uint8_t* p) {
+  uint16_t x = (uint16_t)dx & 0x0FFF;
+  uint16_t y = (uint16_t)dy & 0x0FFF;
+  p[0] = 0;
+  p[1] = 0;
+  p[2] = x & 0xFF;
+  p[3] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4);
+  p[4] = (y >> 4) & 0xFF;
+  p[5] = 0;
+  p[6] = 0;
+}
+
+void generateSyntheticMouseReport(uint32_t index) {
+  const float phase = SYNTHETIC_TWO_PI * ((float)(index % 250) / 250.0f);
+  const int16_t dx = (int16_t)lroundf(4.0f * cosf(phase));
+  const int16_t dy = (int16_t)lroundf(4.0f * sinf(phase));
+  uint8_t data[7];
+  encodeSyntheticMouseDelta(dx, dy, data);
+  syntheticReportsGenerated++;
+  if (queueHidReport(2, data, sizeof(data))) syntheticReportsQueued++;
+  else syntheticReportsQueueDrops++;
+}
+
 void queueReceiverSwitch(uint8_t receiverId) {
   if (receiverId < 1 || receiverId > RECEIVER_COUNT) return;
   HidPacket packet = {};
@@ -427,7 +462,14 @@ void hidNotify(NimBLERemoteCharacteristic* characteristic,
     queueHidReport(1, filtered, sizeof(filtered));
   } else {
     // M720 report ID 2 is 7 bytes; ignore vendor-specific report ID 17.
-    if (reportId == 2 && length == 7) queueHidReport(2, data, length);
+    if (reportId == 2 && length == 7) {
+      if (TEST_SYNTHETIC_WITH_BLE) {
+        // Count the notification, but deliberately discard real movement.
+        mouseReportsDiscardedForTest++;
+      } else {
+        queueHidReport(2, data, length);
+      }
+    }
   }
 
   if ((slot->notificationCount % 50) == 1)
@@ -609,6 +651,13 @@ void setup() {
   Serial.println("========================================");
   Serial.println(" ESP32-S3 BLE KEYBOARD + MOUSE KVM SENDER");
   Serial.println("========================================");
+  if (TEST_SYNTHETIC_WITH_BLE) {
+    Serial.println("[TEST] Synthetic mouse + BLE M720 report counting");
+    Serial.println("[TEST] Real M720 movement data will be discarded.");
+    Serial.println("[TEST] Synthetic reports run for 30 seconds at 125 Hz.");
+  } else {
+    Serial.println("[TEST] Normal BLE mouse forwarding mode.");
+  }
 
   if (!initEspNow()) {
     Serial.println("ESP-NOW setup failed; check configuration.");
@@ -635,6 +684,38 @@ void loop() {
   }
 
   uint32_t now = millis();
+
+  // Synthetic reports use the existing queue and ESP-NOW worker.
+  if (TEST_SYNTHETIC_WITH_BLE) {
+    static bool syntheticStarted = false;
+    static bool syntheticFinished = false;
+    static uint32_t syntheticStartMs = 0;
+    static uint32_t nextSyntheticUs = 0;
+
+    if (!syntheticStarted) {
+      syntheticStarted = true;
+      syntheticStartMs = now;
+      nextSyntheticUs = micros();
+      Serial.println("[TEST] 30-second synthetic stream started.");
+    }
+
+    if (!syntheticFinished && (uint32_t)(now - syntheticStartMs) >= SYNTHETIC_DURATION_MS) {
+      syntheticFinished = true;
+      Serial.println("[TEST] Synthetic stream finished; BLE report counting continues.");
+    }
+
+    if (!syntheticFinished) {
+      uint32_t nowUs = micros();
+      if ((int32_t)(nowUs - nextSyntheticUs) >= 0) {
+        generateSyntheticMouseReport(syntheticReportsGenerated);
+        nextSyntheticUs += SYNTHETIC_INTERVAL_US;
+        if ((int32_t)(nowUs - nextSyntheticUs) >= (int32_t)SYNTHETIC_INTERVAL_US) {
+          nextSyntheticUs = nowUs + SYNTHETIC_INTERVAL_US;
+        }
+      }
+    }
+  }
+
   static uint32_t lastStatus = 0;
   if (now - lastStatus >= 5000) {
     lastStatus = now;
@@ -645,6 +726,13 @@ void loop() {
       mouseSlot.connected ? "connected" : "down",
       mouseSlot.ready ? "ready" : "not-ready",
       (unsigned long)mouseSlot.notificationCount);
+    if (TEST_SYNTHETIC_WITH_BLE) {
+      Serial.printf("[SYNTHETIC TEST] generated=%lu queued=%lu queueDrops=%lu | realM720ReportsReadAndDiscarded=%lu\\n",
+        (unsigned long)syntheticReportsGenerated,
+        (unsigned long)syntheticReportsQueued,
+        (unsigned long)syntheticReportsQueueDrops,
+        (unsigned long)mouseReportsDiscardedForTest);
+    }
     Serial.printf("[ESPNOW] queued=%lu sent=%lu dropped=%lu failed=%lu retries=%lu activeReceiver=%u\n",
       (unsigned long)reportsQueued, (unsigned long)reportsSent,
       (unsigned long)reportsDropped, (unsigned long)sendFailures,
