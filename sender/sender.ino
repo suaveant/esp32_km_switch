@@ -6,7 +6,7 @@
 #include <esp_idf_version.h>
 #include <cstring>
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"fg
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 
 #define HID_SERVICE_UUID 0x1812
@@ -418,9 +418,19 @@ void broadcastReceiverState() {
   packet.version = PROTOCOL_VERSION;
   packet.type = PACKET_SWITCH_RECEIVER;
   packet.reportLength = 1;
-  packet.data[0] = activeReceiver;
-  for (uint8_t i = 0; i < RECEIVER_COUNT; i++)
-    sendPacketAndWait(receiverMacs[i], packet);
+
+  uint8_t receiver;
+  portENTER_CRITICAL(&stateMux);
+  receiver = activeReceiver;
+  portEXIT_CRITICAL(&stateMux);
+
+  packet.data[0] = receiver;
+
+  // Only refresh the currently active receiver. The old implementation
+  // sent this packet to both receivers every 2 seconds. If the inactive
+  // receiver was powered off, the retries blocked the ESP-NOW worker and
+  // introduced queue latency into keyboard/mouse traffic.
+  sendPacketAndWait(receiverMacs[receiver - 1], packet);
 }
 
 void processReceiverSwitch(uint8_t receiverId) {
